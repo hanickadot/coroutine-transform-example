@@ -41,12 +41,16 @@ struct __fib_state: hana::coroutine_promise_base<hana::generator<int>::promise_t
 		// a = std::exchange(b, a + b);
 		CORO_VAR(a) = std::exchange(CORO_VAR(b), CORO_VAR(a) + CORO_VAR(b));
 
+		if (CORO_VAR(b) > 6765) { // stop after 20 values, by jumping to final_suspend
+			CORO_FINAL_SUSPEND();
+		}
+
 		CORO_JUMP(__coro_loop);
 	}
 };
 
 constexpr auto fib() -> hana::generator<int> {
-	return hana::coroutine_helper<__fib_state>::wrapper();
+	return hana::wrapper<__fib_state>();
 }
 
 #include <array>
@@ -56,9 +60,13 @@ constexpr auto fib() -> hana::generator<int> {
 constexpr auto fib() -> hana::generator<int>;
 
 consteval auto compile_time() {
-	auto output = std::array<int, 20>{};
-	auto f = fib();
-	std::ranges::copy_n(f.begin(), output.size(), output.begin());
+	auto output = std::array<int, 30>{};
+	auto it = output.begin();
+
+	for (int v: fib()) {
+		*it++ = v;
+	}
+
 	return output;
 }
 

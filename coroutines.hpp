@@ -147,21 +147,6 @@ constexpr coroutine_base * noop_coroutine() noexcept {
 	return const_cast<noop_coroutine_state *>(&noop_coroutine_val);
 }
 
-// destroy coroutine is a thing to destroy a coroutine from final suspend
-template <typename T> struct destroy_coroutine_state: coroutine_base {
-	static constexpr void destroy_current_coroutine(coroutine_base * base) noexcept {
-		delete static_cast<T *>(base);
-	}
-	constexpr destroy_coroutine_state(coroutine_jump_t resume) noexcept: coroutine_base{resume} { }
-	virtual ~destroy_coroutine_state() noexcept = default;
-};
-
-template <typename T> static constexpr auto destroy_coroutine_val = destroy_coroutine_state<T>{destroy_coroutine_state<T>::return_to_caller};
-
-template <typename T> constexpr coroutine_base * destroy_coroutine() noexcept {
-	return const_cast<destroy_coroutine_state<T> *>(&destroy_coroutine<T>);
-}
-
 // select where to go next, to continuation or somewhere else or to our caller?
 template <typename T, typename Promise = decltype(T::__promise)> constexpr coroutine_base * select_next_or(awaitable<Promise> auto && obj, T * current, coroutine_jump_t continuation) {
 	const auto handle = coroutine_handle{current};
@@ -198,52 +183,86 @@ template <typename T, typename Promise = decltype(T::__promise)> constexpr corou
 #define CORO_AWAIT(AWAITER, CONTINUATION) [[clang::musttail]] return hana::jumpto(hana::select_next_or(AWAITER, static_cast<self *>(__vstate), CONTINUATION))
 
 // start current coroutine
-#define CORO_START() __coro_initial_suspend(__vstate)
+#define CORO_START() __coro_initial_suspend<self>(__vstate)
+
+#define CORO_JUMP_TO_OTHER(COROUTINE) [[clang::musttail]] return jumpto(COROUTINE)
 
 // unconditionaly continue somewhere else...
 #define CORO_JUMP(CONTINUATION) [[clang::musttail]] return CONTINUATION(__vstate);
-
-// final suspend of current coroutine
-#define CORO_FINAL(AWAITER) [[clang::musttail]] return hana::jumpto(hana::final_select(AWAITER), static_cast<self *>(__vstate));
 
 // obtain handle to current coroutine
 #define CORO_HANDLE_FROM_STATE() \
 	hana::coroutine_handle { static_cast<self *>(__vstate) }
 
-template <typename T, typename Promise = decltype(T::__promise)> struct coroutine_helper {
-	using self = T;
+#define CORO_FINAL_SUSPEND() [[clang::musttail]] return hana::__coro_final_suspend<self>(__vstate)
 
-	template <typename... Args> static constexpr auto wrapper(Args &&... args) {
-		T * __vstate = new T;
+// for final suspend
+#define CORO_DESTROY_ITSELF() delete static_cast<self *>(__vstate)
 
-		// copy arguments (ignored here)
-		// construct promise
+// helper functions... normal coroutine transform...
+template <typename self, typename... Args> static constexpr auto wrapper(Args &&... args) {
+	self * __vstate = new self;
 
-		// divergence because std::coroutine_handle<Promise>::from_promise(*this) can't be done in constexpr (without magic), normally this doesn't take any argument
-		auto result = CORO_VAR(__promise).get_return_object(CORO_HANDLE_FROM_STATE());
+	// copy arguments (ignored here)
+	// construct promise
 
-		CORO_START();
+	// divergence because std::coroutine_handle<Promise>::from_promise(*this) can't be done in constexpr (without magic), normally this doesn't take any argument
+	auto result = CORO_VAR(__promise).get_return_object(CORO_HANDLE_FROM_STATE());
 
-		return result;
+	CORO_START();
+
+	return result;
+}
+
+// initial suspend support
+template <typename self> static constexpr void __coro_resume_initial_suspend(hana::coroutine_base * __vstate) {
+	CORO_VAR(initial_awaiter).await_resume();
+	std::destroy_at(&CORO_VAR(initial_awaiter));
+
+	CORO_JUMP(self::__coro_body);
+}
+
+template <typename self> static constexpr void __coro_initial_suspend(hana::coroutine_base * __vstate) {
+	std::construct_at(&CORO_VAR(initial_awaiter), CORO_VAR(__promise).initial_suspend());
+
+	CORO_AWAIT(CORO_VAR(initial_awaiter), (__coro_resume_initial_suspend<self>));
+}
+
+// final suspend
+template <typename self> static constexpr void __coro_final_suspend(hana::coroutine_base * __vstate) {
+	{ // so we can do safely tail call, awaiter must be destroyed
+		auto awaiter = CORO_VAR(__promise).final_suspend();
+
+		__vstate->__next = nullptr; // so .done() check will work
+
+		// we won't suspend => destroy coroutine state
+		if (awaiter.await_ready()) {
+			CORO_DESTROY_ITSELF();
+			return;
+		}
+
+		using R = decltype(awaiter.await_suspend(CORO_HANDLE_FROM_STATE()));
+
+		if constexpr (suspend_will_always_suspend<R>) {
+			awaiter.await_suspend(CORO_HANDLE_FROM_STATE());
+			return; // return to our caller
+
+		} else if constexpr (suspend_will_sometimes_suspend<R>) {
+			if (!awaiter.await_suspend(CORO_HANDLE_FROM_STATE())) {
+				CORO_DESTROY_ITSELF(); // destroy if we didn't suspend
+			}
+			return; // and return to our caller
+
+		} else {
+			static_assert(suspend_will_jump_somewhere<R>);
+			// jump somewhere else (reusing variable)
+			__vstate = awaiter.await_suspend(CORO_HANDLE_FROM_STATE()).__coro;
+			// and fallthrough
+		}
 	}
 
-	static constexpr void __coro_initial_suspend(hana::coroutine_base * __vstate) {
-		std::construct_at(&CORO_VAR(initial_awaiter), CORO_VAR(__promise).initial_suspend());
-
-		CORO_AWAIT(CORO_VAR(initial_awaiter), __coro_resume_initial_suspend);
-	}
-	static constexpr void __coro_resume_initial_suspend(hana::coroutine_base * __vstate) {
-		CORO_VAR(initial_awaiter).await_resume();
-		std::destroy_at(&CORO_VAR(initial_awaiter));
-
-		CORO_JUMP(T::__coro_body);
-	}
-	static constexpr void __coro_final_suspend(hana::coroutine_base * __vstate) {
-		// final suspend can be a local variable, as await_resume won't be ever called
-		CORO_AWAIT(CORO_VAR(__promise).final_suspend(), destroy_coroutine<self>);
-	}
-};
-
+	CORO_JUMP_TO_OTHER(__vstate);
+}
 } // namespace hana
 
 #endif
