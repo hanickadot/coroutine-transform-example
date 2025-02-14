@@ -1,6 +1,17 @@
 #include "generator.hpp"
 #include "helpers.hpp"
 
+// originally:
+std::generator<int> fibonnaci_runtime() {
+	int a = 0;
+	int b = 1;
+
+	for (;;) {
+		co_yield b;
+		a = std::exchange(b, a + b);
+	}
+}
+
 struct __fib_state: hana::coroutine_promise_base<hana::generator<int>::promise_type> {
 	// our promise type
 	using promise_type = hana::generator<int>::promise_type;
